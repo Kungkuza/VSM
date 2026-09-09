@@ -1,0 +1,12 @@
+{
+  "nvd_api_key": "",
+  "min_cvss_score": 7.0,
+  "min_epss_score": 0.10,
+  "nmap_path": "C:\\Program Files (x86)\\Nmap\\nmap.exe",
+  "nse_custom_dir": ".\\scripts\\custom\\",
+  "fallback_to_circl": true,
+  "max_concurrent_workers": 10,
+  "allowed_script_sources": [
+    "https://raw.githubusercontent.com/nmap/nmap/master/scripts/"
+  ]
+}
