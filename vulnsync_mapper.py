@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VulnSync-Mapper (VSM)
-Automated Nmap Scan Parser, Vulnerability Correlator, and NSE Script Synchronizer.
+Quick CVE/EPSS correlator and NSE script sync for Nmap scans.
 """
 
 import argparse
@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import urllib.request
@@ -18,124 +17,106 @@ from typing import Any, Dict, List
 
 import aiohttp
 
-# Set up logging formatting
-logging.basicConfig(level=logging.INFO, format="[*] %(message)s")
+logging.basicConfig(level=logging.INFO, format="[+] %(message)s")
+
+DEFAULT_CONFIG = {
+    "nvd_api_key": "",
+    "min_cvss_score": 7.0,
+    "min_epss_score": 0.10,
+    "nmap_path": "nmap",
+    "nse_custom_dir": "./scripts/custom/",
+    "fallback_to_circl": True,
+    "max_concurrent_workers": 10,
+    "allowed_script_sources": [
+        "https://raw.githubusercontent.com/nmap/nmap/master/scripts/"
+    ],
+}
 
 
-class ConfigManager:
-    """Manages application configuration, creating default config.json if missing."""
+def load_config(config_path: str = "config.json") -> Dict[str, Any]:
+    """Loads JSON config or generates default if missing."""
+    if not os.path.exists(config_path):
+        with open(config_path, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=4)
+        logging.info(f"Created default config at {config_path}")
+        return DEFAULT_CONFIG
 
-    DEFAULT_CONFIG = {
-        "nvd_api_key": "",
-        "min_cvss_score": 7.0,
-        "min_epss_score": 0.10,
-        "nse_custom_dir": "./scripts/custom/",
-        "fallback_to_circl": True,
-        "max_concurrent_workers": 10,
-        "allowed_script_sources": [
-            "https://raw.githubusercontent.com/nmap/nmap/master/scripts/"
-        ],
-    }
+    with open(config_path, "r") as f:
+        config = json.load(f)
 
-    @staticmethod
-    def load_config(config_path: str = "config.json") -> Dict[str, Any]:
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
-                json.dump(ConfigManager.DEFAULT_CONFIG, f, indent=4)
-            logging.info(f"Created default configuration file at {config_path}")
-            return ConfigManager.DEFAULT_CONFIG
+    # Pull from environment if not explicitly set in config file
+    if not config.get("nvd_api_key"):
+        config["nvd_api_key"] = os.getenv("NVD_API_KEY", "")
 
-        with open(config_path, "r") as f:
-            config = json.load(f)
-
-        # Check environment variable if config key is empty
-        if not config.get("nvd_api_key"):
-            config["nvd_api_key"] = os.getenv("NVD_API_KEY", "")
-
-        return config
+    return config
 
 
-class ScanParser:
-    """Parses Nmap XML outputs or executes direct Nmap scans."""
+def parse_nmap_xml(xml_path: str) -> List[Dict[str, Any]]:
+    """Extracts IP, open ports, banners, and CPEs from Nmap XML exports."""
+    if not os.path.exists(xml_path):
+        logging.error(f"Scan file not found: {xml_path}")
+        sys.exit(1)
 
-    @staticmethod
-    def parse_xml(xml_path: str) -> List[Dict[str, Any]]:
-        """Extracts IP addresses, ports, services, and CPEs from Nmap XML exports."""
-        if not os.path.exists(xml_path):
-            logging.error(f"Target XML file not found: {xml_path}")
-            sys.exit(1)
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    targets = []
 
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        targets = []
+    for host in root.findall("host"):
+        status = host.find("status")
+        if status is not None and status.get("state") != "up":
+            continue
 
-        for host in root.findall("host"):
-            status = host.find("status")
-            if status is not None and status.get("state") != "up":
+        addr_elem = host.find("address[@addrtype='ipv4']") or host.find("address")
+        ip = addr_elem.get("addr") if addr_elem is not None else "Unknown"
+
+        ports_elem = host.find("ports")
+        if ports_elem is None:
+            continue
+
+        for port in ports_elem.findall("port"):
+            state_elem = port.find("state")
+            if state_elem is None or state_elem.get("state") != "open":
                 continue
 
-            # Identify IP address
-            addr_elem = host.find("address[@addrtype='ipv4']")
-            if addr_elem is None:
-                addr_elem = host.find("address")
-            ip = addr_elem.get("addr") if addr_elem is not None else "Unknown"
+            port_id = port.get("portid")
+            proto = port.get("protocol")
+            service_elem = port.find("service")
 
-            ports_elem = host.find("ports")
-            if ports_elem is None:
-                continue
+            svc_name = service_elem.get("name", "unknown") if service_elem is not None else "unknown"
+            product = service_elem.get("product", "") if service_elem is not None else ""
+            version = service_elem.get("version", "") if service_elem is not None else ""
 
-            for port in ports_elem.findall("port"):
-                state_elem = port.find("state")
-                if state_elem is None or state_elem.get("state") != "open":
-                    continue
+            cpes = []
+            if service_elem is not None:
+                for cpe_elem in service_elem.findall("cpe"):
+                    if cpe_elem.text:
+                        cpes.append(cpe_elem.text)
 
-                port_id = port.get("portid")
-                protocol = port.get("protocol")
-                service_elem = port.find("service")
+            targets.append({
+                "ip": ip,
+                "port": f"{port_id}/{proto}",
+                "service": svc_name,
+                "banner": f"{product} {version}".strip(),
+                "cpes": cpes,
+            })
 
-                service_name = (
-                    service_elem.get("name") if service_elem is not None else "unknown"
-                )
-                product = (
-                    service_elem.get("product", "") if service_elem is not None else ""
-                )
-                version = (
-                    service_elem.get("version", "") if service_elem is not None else ""
-                )
-
-                cpes = []
-                if service_elem is not None:
-                    for cpe_elem in service_elem.findall("cpe"):
-                        if cpe_elem.text:
-                            cpes.append(cpe_elem.text)
-
-                targets.append(
-                    {
-                        "ip": ip,
-                        "port": f"{port_id}/{protocol}",
-                        "service": service_name,
-                        "banner": f"{product} {version}".strip(),
-                        "cpes": cpes,
-                    }
-                )
-
-        return targets
-
-    @staticmethod
-    def run_live_scan(target: str, output_xml: str = "temp_scan.xml") -> List[Dict[str, Any]]:
-        """Executes a live Nmap discovery scan and returns parsed targets."""
-        logging.info(f"Initiating live Nmap discovery sweep against target: {target}")
-        cmd = ["nmap", "-sV", "-O", "-oX", output_xml, target]
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return ScanParser.parse_xml(output_xml)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logging.error(f"Failed to execute Nmap scan. Ensure Nmap is installed: {e}")
-            sys.exit(1)
+    return targets
 
 
-class VulnerabilityCorrelator:
-    """Handles asynchronous vulnerability lookups against NVD, CIRCL, and EPSS APIs."""
+def run_live_scan(target: str, nmap_bin: str = "nmap", output_xml: str = "temp_scan.xml") -> List[Dict[str, Any]]:
+    """Runs a quick live scan against the target and returns parsed results."""
+    logging.info(f"Running live scan on target: {target}")
+    cmd = [nmap_bin, "-sV", "-O", "-oX", output_xml, target]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return parse_nmap_xml(output_xml)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logging.error(f"Nmap execution failed. Verify your installation/path: {e}")
+        sys.exit(1)
+
+
+class VulnLookup:
+    """Handles NVD API lookups with CIRCL fallback and EPSS scoring."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -143,8 +124,7 @@ class VulnerabilityCorrelator:
         self.circl_url = "https://cve.circl.lu/api/cvefor/"
         self.epss_url = "https://api.first.org/data/v1/epss"
 
-    async def fetch_epss_score(self, session: aiohttp.ClientSession, cve_id: str) -> float:
-        """Queries FIRST EPSS API for exploitation probability score."""
+    async def get_epss(self, session: aiohttp.ClientSession, cve_id: str) -> float:
         try:
             async with session.get(f"{self.epss_url}?cve={cve_id}", timeout=5) as resp:
                 if resp.status == 200:
@@ -156,50 +136,49 @@ class VulnerabilityCorrelator:
         return 0.0
 
     async def query_cpe(self, session: aiohttp.ClientSession, cpe_str: str) -> List[Dict[str, Any]]:
-        """Queries NVD REST API with automated CIRCL fallback for rate limiting."""
         headers = {}
         api_key = self.config.get("nvd_api_key")
         if api_key:
             headers["apiKey"] = api_key
 
-        params = {"cpeName": cpe_str}
         results = []
-
         try:
-            async with session.get(self.nvd_url, params=params, headers=headers, timeout=8) as resp:
+            async with session.get(self.nvd_url, params={"cpeName": cpe_str}, headers=headers, timeout=8) as resp:
                 if resp.status == 200:
-                    payload = await resp.json()
-                    for item in payload.get("vulnerabilities", []):
+                    data = await resp.json()
+                    for item in data.get("vulnerabilities", []):
                         cve = item.get("cve", {})
                         cve_id = cve.get("id")
                         metrics = cve.get("metrics", {})
 
-                        cvss_score = 0.0
+                        cvss = 0.0
                         if "cvssMetricV31" in metrics:
-                            cvss_score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
+                            cvss = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
                         elif "cvssMetricV30" in metrics:
-                            cvss_score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
+                            cvss = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
 
-                        if cvss_score >= self.config["min_cvss_score"]:
-                            epss_score = await self.fetch_epss_score(session, cve_id)
-                            results.append(
-                                {
-                                    "cve_id": cve_id,
-                                    "cvss": cvss_score,
-                                    "epss": epss_score,
-                                    "summary": cve.get("descriptions", [{}])[0].get("value", "N/A"),
-                                }
-                            )
+                        if cvss >= self.config["min_cvss_score"]:
+                            epss = await self.get_epss(session, cve_id)
+                            results.append({
+                                "cve_id": cve_id,
+                                "cvss": cvss,
+                                "epss": epss,
+                                "summary": cve.get("descriptions", [{}])[0].get("value", "N/A"),
+                            })
                     return results
-                elif resp.status == 429 and self.config["fallback_to_circl"]:
-                    logging.warning(f"NVD Rate limit hit for {cpe_str}. Routing to CIRCL fallback...")
-                    return await self._query_circl_fallback(session, cpe_str)
+                
+                # NVD rate limit hit, drop to fallback
+                if resp.status == 429 and self.config.get("fallback_to_circl"):
+                    logging.warning(f"Rate limited by NVD for {cpe_str}. Trying CIRCL API...")
+                    return await self._circl_fallback(session, cpe_str)
+
         except Exception:
-            if self.config["fallback_to_circl"]:
-                return await self._query_circl_fallback(session, cpe_str)
+            if self.config.get("fallback_to_circl"):
+                return await self._circl_fallback(session, cpe_str)
+
         return results
 
-    async def _query_circl_fallback(self, session: aiohttp.ClientSession, cpe_str: str) -> List[Dict[str, Any]]:
+    async def _circl_fallback(self, session: aiohttp.ClientSession, cpe_str: str) -> List[Dict[str, Any]]:
         results = []
         try:
             async with session.get(f"{self.circl_url}{cpe_str}", timeout=6) as resp:
@@ -209,57 +188,54 @@ class VulnerabilityCorrelator:
                         cvss = float(entry.get("cvss", 0.0))
                         if cvss >= self.config["min_cvss_score"]:
                             cve_id = entry.get("id")
-                            epss = await self.fetch_epss_score(session, cve_id)
-                            results.append(
-                                {
-                                    "cve_id": cve_id,
-                                    "cvss": cvss,
-                                    "epss": epss,
-                                    "summary": entry.get("summary", "N/A"),
-                                }
-                            )
+                            epss = await self.get_epss(session, cve_id)
+                            results.append({
+                                "cve_id": cve_id,
+                                "cvss": cvss,
+                                "epss": epss,
+                                "summary": entry.get("summary", "N/A"),
+                            })
         except Exception as e:
             logging.error(f"CIRCL query failed for {cpe_str}: {e}")
         return results
 
 
-class ScriptSynchronizer:
-    """Downloads remote NSE scripts or constructs dynamic stub probes locally."""
+class ScriptSync:
+    """Fetches NSE scripts remotely or generates basic detection stubs."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.script_dir = config.get("nse_custom_dir", "./scripts/custom/")
         os.makedirs(self.script_dir, exist_ok=True)
 
-    def sync_script(self, cve_id: str) -> str:
-        clean_cve = cve_id.lower().replace("-", "_")
-        script_name = f"exploit_{clean_cve}.nse"
+    def sync(self, cve_id: str) -> str:
+        script_name = f"exploit_{cve_id.lower().replace('-', '_')}.nse"
         local_path = os.path.join(self.script_dir, script_name)
 
         if os.path.exists(local_path):
             return script_name
 
-        # Download from trusted source repositories
+        # Try downloading from remote repos
         for base_url in self.config.get("allowed_script_sources", []):
             url = f"{base_url}{script_name}"
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "VulnSync-Mapper/1.0"})
-                with urllib.request.urlopen(req, timeout=4) as response:
-                    if response.status == 200:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
                         with open(local_path, "w") as f:
-                            f.write(response.read().decode("utf-8"))
+                            f.write(resp.read().decode("utf-8"))
                         self._reindex_db()
                         return script_name
             except Exception:
                 continue
 
-        # Generate a dynamic validation stub if script does not exist remotely
-        return self._generate_stub(cve_id, local_path)
+        # Generate local fallback stub
+        return self._make_stub(cve_id, local_path)
 
-    def _generate_stub(self, cve_id: str, path: str) -> str:
-        stub = f"""-- Dynamic Auto-Generated NSE Probe for {cve_id}
-description = [[ Automated probe detecting exposure for {cve_id}. ]]
-author = "VulnSync-Mapper"
+    def _make_stub(self, cve_id: str, path: str) -> str:
+        stub = f"""-- Auto-generated stub for {cve_id}
+description = [[ Check host exposure for {cve_id}. ]]
+author = "VSM"
 categories = {{"vuln", "safe"}}
 
 portrule = function(host, port)
@@ -267,7 +243,7 @@ portrule = function(host, port)
 end
 
 action = function(host, port)
-  return string.format("EXPOSURE ALERT: Target host %s port %d flagged for {cve_id}.", host.ip, port.number)
+  return string.format("EXPOSURE ALERT: Target %s:%d flagged for {cve_id}.", host.ip, port.number)
 end
 """
         with open(path, "w") as f:
@@ -276,63 +252,67 @@ end
         return os.path.basename(path)
 
     def _reindex_db(self):
+        nmap_bin = self.config.get("nmap_path", "nmap")
         try:
-            subprocess.run(["nmap", "--script-updatedb"], capture_output=True)
+            subprocess.run([nmap_bin, "--script-updatedb"], capture_output=True)
         except Exception:
             pass
 
 
 async def main_async(args, config):
+    nmap_bin = config.get("nmap_path", "nmap")
+    
     if args.xml_target:
-        targets = ScanParser.parse_xml(args.xml_target)
+        targets = parse_nmap_xml(args.xml_target)
     else:
-        targets = ScanParser.run_live_scan(args.target)
+        targets = run_live_scan(args.target, nmap_bin=nmap_bin)
 
-    logging.info(f"Loaded {len(targets)} active port/service instances for analysis.")
+    logging.info(f"Loaded {len(targets)} active service instances.")
 
-    correlator = VulnerabilityCorrelator(config)
-    synchronizer = ScriptSynchronizer(config) if args.update_scripts else None
+    vuln_lookup = VulnLookup(config)
+    script_sync = ScriptSync(config) if args.update_scripts else None
 
     connector = aiohttp.TCPConnector(limit=config.get("max_concurrent_workers", 10))
     async with aiohttp.ClientSession(connector=connector) as session:
         for target in targets:
-            print(f"\n>> Target Device: {target['ip']} | Port: {target['port']} ({target['service']})")
+            print(f"\n[>] Host: {target['ip']} | Port: {target['port']} ({target['service']})")
+            
             if not target["cpes"]:
-                print("   [!] No explicit CPE strings extracted.")
+                print("    [-] No CPE strings found.")
                 continue
 
             for cpe in target["cpes"]:
-                print(f"   [+] Querying vulnerabilities for CPE: {cpe}")
-                vulns = await correlator.query_cpe(session, cpe)
+                print(f"    [*] Querying CPE: {cpe}")
+                vulns = await vuln_lookup.query_cpe(session, cpe)
 
                 if not vulns:
-                    print("       ✔ No critical vulnerabilities matched CVSS/EPSS thresholds.")
+                    print("        [+] No matching high-severity CVEs found.")
                     continue
 
                 for v in vulns:
                     if v["epss"] < args.min_epss:
                         continue
 
-                    print(f"       X [{v['cve_id']}] CVSS: {v['cvss']} | EPSS: {v['epss']:.2f}")
-                    print(f"         Summary: {v['summary'][:100]}...")
+                    print(f"        [!] {v['cve_id']} (CVSS: {v['cvss']} | EPSS: {v['epss']:.2f})")
+                    print(f"            {v['summary'][:110]}...")
 
-                    if synchronizer:
-                        script_file = synchronizer.sync_script(v["cve_id"])
-                        print(f"         Action: Synced NSE verification script -> {script_file}")
+                    if script_sync:
+                        script_file = script_sync.sync(v["cve_id"])
+                        print(f"            └─ Staged NSE script: {script_file}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VulnSync-Mapper (VSM) Vulnerability Correlation Tool")
+    parser = argparse.ArgumentParser(description="VulnSync-Mapper (VSM) - Scan parser & threat correlator")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--xml-target", help="Path to Nmap XML scan export file (-oX)")
-    group.add_argument("--target", help="IP address or subnet to run a live scan against")
+    group.add_argument("--xml-target", help="Path to Nmap XML scan results (-oX)")
+    group.add_argument("--target", help="Target IP or CIDR for live scan")
 
-    parser.add_argument("--min-cvss", type=float, default=7.0, help="Minimum CVSS base score threshold")
-    parser.add_argument("--min-epss", type=float, default=0.05, help="Minimum EPSS score threshold")
-    parser.add_argument("--update-scripts", action="store_true", help="Download/generate matching NSE scripts")
+    parser.add_argument("--min-cvss", type=float, default=7.0, help="Minimum CVSS threshold")
+    parser.add_argument("--min-epss", type=float, default=0.05, help="Minimum EPSS probability threshold")
+    parser.add_argument("--update-scripts", action="store_true", help="Download or generate matching NSE verification scripts")
 
     args = parser.parse_args()
-    config = ConfigManager.load_config()
+    config = load_config()
 
     if args.min_cvss:
         config["min_cvss_score"] = args.min_cvss
